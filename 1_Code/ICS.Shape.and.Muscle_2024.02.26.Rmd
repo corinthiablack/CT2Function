@@ -1,0 +1,1107 @@
+---
+title: "ICS_ShapeCode"
+author: "Corinthia Black"
+date: '2022-09-29'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#library(devtools)
+#install_github("JClavel/mvMORPH")
+
+#Read and treat data
+library(dispRity)
+library(geomorph)
+library(readxl)
+library(Morpho)
+library(MASS)
+library(Rvcg)
+library(PCDimension)
+library(mvMORPH)
+library(phytools)
+library(MetBrewer)
+library(RColorBrewer)
+library(ape)
+library(geiger)
+library(nlme)
+library(phytools)
+library(multcomp)
+library(dplyr)
+library(rlist)
+#library(data.table)
+
+#Visualisation tools
+library(scales)
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(gridExtra)
+#library(htmlwidgets) #now requires Pandoc: https://pandoc.org/installing.htmllibrary(plotly)
+library(plotly)
+library(rayshader)
+library(viridis)
+library(abind)
+library("devtools")
+#install_github("JosephCrispell/basicPlotteR")
+library(basicPlotteR)
+library(vioplot)
+library(factoextra)
+
+#Muscle modeling
+library(spatstat.geom) #estimating fiber number based on polygon
+library(pls) #compare estimated fibers to actual
+
+
+keep.coordinates.only = function (input) {
+  input = as.matrix(input [, 2:4])
+  return(input)
+}
+
+which.median = function(x) {
+  if (length(x) %% 2 != 0) {
+    which(x == median(x))
+  } else if (length(x) %% 2 == 0) {
+    a = sort(x)[c(length(x)/2, length(x)/2+1)]
+    c(which(x == a[1]), which(x == a[2]))
+  }
+}
+rad2deg <- function(rad) {(rad * 180) / (pi)}
+
+deg2rad <- function(deg) {(deg * pi) / (180)}
+```
+
+```{r Import Models & Landmarks, results='FALSE'}
+template <- read.ply(file='../0_Raw Data/ICS_Shape_2023.9.07/templates/Sphere_252.ply',ShowSpecimen=FALSE)
+
+#Import all meshes with .pts data (fixed landmarks)
+landpts <- dir(path = "../0_Raw Data/ICS_Shape_2023.9.07/sliding.landmarks/",pattern='.fcsv')
+taxa_list <- substr(c(landpts),1,nchar(c(landpts))-13)
+
+#Create mesh3d objects named as the ply files, it can be very long  depending on the number of files 
+meshlist <- list()
+
+for(i in 1:length(taxa_list)){
+    meshlist[[i]] <- assign(taxa_list[i],read.ply(file=paste("../0_Raw Data/ICS_Shape_2023.9.07/surfaces/",taxa_list[i],".ply",sep=""), ShowSpecimen=FALSE))
+  print(paste(round(100*(i/length(taxa_list)),1),"%"))
+}
+
+names(meshlist) <- taxa_list
+
+#Create array with all fixed landmarks of all specimens and the template
+# ! strangely enough, the coordinates exported from Checkpoint as .pts need to be multiplied by 10!
+to_patch<-array(dim=c(12,3,length(landpts)))
+
+for (i in 1:length(landpts)) {
+    lms = read.csv (file=paste("../0_Raw Data/ICS_Shape_2023.9.07/sliding.landmarks/",landpts[i], sep = ""), skip = 3, header = F)
+    to_patch [,,i] = keep.coordinates.only(lms)
+}
+
+dimnames(to_patch)[[3]] <- taxa_list
+
+#Check the fixed LMs
+shade3d(Dictyna_brevitarsus,col="#f2d09b50")
+spheres3d(to_patch[,,"Dictyna_brevitarsus"],radius=.002,color="blue")
+```
+
+```{r Create the Atlas, results='FALSE'}
+temp <- as.matrix(read.table(file="../0_Raw Data/ICS_Shape_2023.9.07/templates/template12_252.fcsv",skip=2, sep = ",")) # or directly load a file
+template_lands = temp[,2:4]
+class(template_lands) <- "numeric"
+
+#automatically create surface landmarks by randomly sampling the coordinates of the point cloud of the template: this method draws from the pseudolandmark approach and applies it to surface landmarking
+temp_points <- t(template$vb)[,1:3]
+#temp_points <- temp_points[temp_points[,"zpts"]>0.01,]
+
+sample <- sample(1:nrow(temp_points),252,replace=FALSE) #642 lands
+template_surface_sample <- temp_points[sample,]
+
+#check if the template is ok
+  #shade3d(template,col="grey")
+  #spheres3d(template_surface_sample,radius=c(rep(0.1,12), rep(.01, nrow(template_surface_sample))),color="blue")
+
+###	Create Atlas/template
+  atlas <- createAtlas(template,template_lands,template_surface_sample)
+ plotAtlas(atlas,cols=c("#2096FF","#23CC8F"),legend=FALSE)
+```
+
+```{r Patching}
+###Patching
+
+#Patch! ####Need to change path to all ply files path###### ~/Desktop/Research Projects/2022_SpiderIntercheliceralShape/0_Raw Data/surface files for analyses/intercheliceralsclerite/ply/
+
+patched <- placePatch(atlas, to_patch, path="../0_Raw Data/ICS_Shape_2023.9.07/surfaces/")
+#checkLM(patched, path="./", atlas=atlas, pt.size=1)
+
+#OPTIONAL: visualization of individual teeth with their patches
+  shade3d(Dictyna_brevitarsus,col="#f2d09b")
+  spheres3d(patched[,,"Dictyna_brevitarsus"],radius=.001,color=c(rep("#2096FF",12),rep("#23CC8F",nrow(patched[,,1]))))
+```
+
+```{r Slide Surface Landmarks}
+fixed <- 1:12
+surface <- c(1:nrow(patched))[-fixed]
+  
+surface.slide <- slider3d(patched, SMvector=fixed, deselect=TRUE, surp=surface, iterations=13, meshlist=meshlist, mc.cores=6,fixRepro=FALSE)
+```
+
+```{r Replace Temporary Landmarks with Homologous Landmarks}
+#import actual homologous lands, append to data, remove fake 12
+
+homologous.lm<-array(dim=c(5,3,length(landpts)))
+
+for (i in 1:length(landpts)) {
+    lms = read.csv (file=paste("../0_Raw Data/ICS_Shape_2023.9.07/homologous.landmarks/",taxa_list[i], "_Homologous.fcsv", sep = ""), skip = 3, header = F)
+    homologous.lm [,,i] = keep.coordinates.only(lms)
+}
+
+dimnames(homologous.lm)[[3]] <- taxa_list
+
+surface.only = patched[13:nrow(surface.slide$dataslide),,]
+
+homo.surface.only = abind(homologous.lm, surface.only, along = 1)
+  
+fixed <- 1:5
+surface <- c(1:nrow(homo.surface.only))[-fixed]
+
+#OPTIONAL: visualization of individual teeth with their patches
+  shade3d(Deinopidae_sp,col="#f2d09b")
+  spheres3d(homo.surface.only[,,"Deinopidae_sp"],radius=c(rep(.01,5),rep(0.0005,nrow(homo.surface.only))),color=c(rep("#F25837",5),rep("#23CC8F",nrow(homo.surface.only))))
+  
+  #rgl.snapshot('../3_Figures and Tables/0_Figures Raw/Surface_Landmarks_forFigures/Nesticus_sylvestrii.ant.png', fmt = 'png')
+```
+
+```{r GPA}
+###General Procrustes Analysis
+GPA <- gpagen(homo.surface.only,surfaces=surface,ProcD=FALSE)
+PCA <- gm.prcomp(GPA$coords)
+
+plot(PCA)
+summary(PCA)
+
+lambda=PCA$sdev^2 
+sig_axes = bsDimension(lambda) #2 significant axes
+
+findMeanSpec(GPA$coords)
+
+#Check if position of 3DLM appear correct ## USE FOR FIGURES
+  shade3d(Dictyna_brevitarsus,col="#f2d09b50")
+  spheres3d(homo.surface.only[,,"Dictyna_brevitarsus"],radius=c(rep(.002,5),rep(.0005,nrow(homo.surface.only))),color=c(rep("#FF0D68",5),rep("#23CC8F",nrow(homo.surface.only))))
+```
+
+```{r Input Muscle Modeling Data}
+polygons=list.files(path='../0_Raw Data/Muscle_Data_2023.03.22/Polygons_All/', pattern='.fcsv')
+centroids=list.files(path='../0_Raw Data/Muscle_Data_2023.03.22/Centroids_All/', pattern='.fcsv')
+
+spider.muscles=data.frame(matrix(ncol = 40, nrow = length(centroids))) #create data frame to hold values
+colnames(spider.muscles)=c("Species", "CW", "IA", "N", "FA",
+# "MSX", "MSY", "MSZ", "MST",
+"Mean.Fiber.Length", "MinY", "MaxY", "LengthY",
+"MXT", "MYT", "MZT", "MM",
+"MXT.FA", "MYT.FA", "MZT.FA", "MM.FA", 
+# "MSX.FA", "MSY.FA", "MSZ.FA", "MST.FA", 
+# "MSY.FA.sizecorr.cube", "MST.FA.sizecorr.cube",  #Force based on length
+# "SumAXY", "SumAXZ", "SumAYZ",
+"StDev.AXY", "Min.AXY", "Max.AXY", "Span.AXY",
+"Ave.AXY", "SumMXY", "SumMXY.FA", 
+"StDev.AXZ", "Min.AXZ", "Max.AXZ", "Span.AXZ",
+"Ave.AXZ", "SumMXZ", "SumMXZ.FA", 
+"StDev.AYZ", "Min.AYZ", "Max.AYZ", "Span.AYZ",
+"Ave.AYZ", "SumMYZ", "SumMYZ.FA", #Angle vector and magnitude
+# "Ant.Most.Coords", "Post.Most.Coords", "Med.Most.Coords", "Lat.Most.Coords", 
+"InPhylogeny", "ID") 
+#set column names; CW = Carapace Width, IA = Insertion.Area, N = Fiber number/muscle, FA = Fiber Area
+
+rownames(spider.muscles) <- gsub("\\_.*","",centroids) #set row names to specimens in centroid folder
+
+spider.measurements = read.csv("../0_Raw Data/Characters.2023.07.26.csv", header = T) #read character matrix that includes fiber values
+row.names(spider.measurements)=make.unique(spider.measurements$Genus,sep=".")
+
+check.measurements = data.frame(matrix(ncol = 3, nrow = length(centroids)))
+colnames(check.measurements)=c("Total.FibersL","Estimated.Fibers", "CW") #set column names
+rownames(check.measurements) <- gsub("\\_.*","",centroids) #set row names to specimens in centroid folder
+
+polygon_list <- list()
+points_list <- list()
+```
+
+```{r Estimate Relative Force and Angle Values for Muscle}
+for(i in 1:nrow(spider.muscles)) {       # for-loop over rows
+  ##### INPUT DATA, CALCULATE N FIBERS, ESTIMATE FIBER COORDINATES #####
+    # read polygon for specimen in list
+    ics.polygon = read.csv (file = paste0("../0_Raw Data/Muscle_Data_2023.03.22/Polygons_All/", polygons[i]), skip = 3, header = F)
+    ics.polygon = ics.polygon[,2:4,] #retain (x,y,z) coordinates for polygon
+    #print(ics.polygon) #checkpoint
+    
+    # read centroid for specimen in list
+    ics.centroid = read.csv (file = paste0("../0_Raw Data/Muscle_Data_2023.03.22/Centroids_All/", centroids[i]), skip = 3, header = F)
+    ics.centroid = ics.centroid[,2:4,] #retain (x,y,z) coordinates for origin
+    #print(ics.centroid) #checkpoint
+    
+    # translate the polygon to set the origin to (0,0,0)
+    ics.polygon.translated <- data.frame(matrix(ncol = 3, nrow = nrow(ics.polygon)))
+    colnames(ics.polygon.translated) = c("x","y","z")
+    
+    ics.polygon.translated$x = (ics.polygon$V2 - ics.centroid$V2)
+    ics.polygon.translated$y = (ics.polygon$V3 - ics.centroid$V3)
+    ics.polygon.translated$z = (ics.polygon$V4 - ics.centroid$V4)
+    #print(ics.polygon.translated)
+    
+    # Create a list where translated polygons will be stored, can use these to check for correct placement of polygons
+    polygon_list[[i]] <- ics.polygon.translated
+  
+    # Read in the number of fibers on x axis and y axis from character matrix
+    specimen = gsub("\\_.*","",centroids[i])
+    
+    fibers.x = spider.measurements[specimen,]$NFibers.X #Number of fibers lateral -> medial at widest area
+    fibers.y = spider.measurements[specimen,]$NFibers.Y #number of fibers anterior -> posterior
+    #print(c(fibers.x,",",fibers.y)) #checkpoint
+    #print(specimen) #checkpoint
+    
+    # Estimate number of fibers that fall into the polygon
+    bdry <- list(x=ics.polygon.translated$x,
+                 y=ics.polygon.translated$y) #create the boundary of polygon
+    w <- owin(c(min(ics.polygon.translated$x),max(ics.polygon.translated$x)), c(min(ics.polygon.translated$y),max(ics.polygon.translated$y)), poly=bdry) #create a window within a 2D plane for grid to be created
+    xy <- gridcentres(w, fibers.x, fibers.y) #create grid that falls into window based on number of fibers at widest and longest part of muscle
+    ok <- inside.owin(xy$x, xy$y, w) #find points that fall within the polygon
+    points.needed = data.frame(xy$x[ok], xy$y[ok]) #keep only (x,y) points that fall into the polygon
+    points.needed$xy.z.ok = mean(ics.polygon.translated$z) #add the z coordinate to the (x,y) coordinates
+    ##because z coordinates are on same plane, this will be the same for all points in the data set
+    #print(points.needed) #checkpoint
+    
+    # Check if estimated fibers are close to real counts
+    check.measurements[specimen,]$Total.FibersL = spider.measurements[specimen,]$Total.FibersL
+    check.measurements[specimen,]$CW = spider.measurements[specimen,]$Carapace.Width
+    check.measurements[i,]$Estimated.Fibers = nrow(points.needed)
+  
+    # Calculate the magnitude of each fiber within the polygon for a single specimen
+    #MX = magnitude of x
+    #MY = magnitude of y 
+    #MZ = magnitude of z
+    colnames(points.needed) = c("x","y","z")
+    
+    spider.muscles[i,]$MinY = min(points.needed$y) #find minimum value for y axis
+    spider.muscles[i,]$MaxY = max(points.needed$y) #find maximum value for y axis
+    spider.muscles[i,]$LengthY = spider.muscles[i,]$MaxY - spider.muscles[i,]$MinY #find length of y axis across polygon
+      
+    
+  # ##### CALCULATE FORCE OF EACH FIBER BASED ON LENGTH #####
+  #   points.needed$M = NA
+  #   
+  #         for(p in 1:nrow(points.needed)) { 
+  #           points.needed[p,]$M = ((points.needed[p,]$x^2)+(points.needed[p,]$y^2)+(points.needed[p,]$z^2))^.5
+  #         } #loop through each point in polygon to calculate magnitude for each fiber
+  #   
+  #   spider.muscles[i,]$Mean.Fiber.Length = mean(points.needed$M)      
+  #   
+  #   points.needed$MX = NA
+  #   points.needed$MY = NA
+  #   points.needed$MZ = NA
+  #   
+  #         for(n in 1:nrow(points.needed)) { 
+  #           points.needed[n,]$MX = points.needed[n,]$x/points.needed[n,]$M
+  #           points.needed[n,]$MY = points.needed[n,]$y/points.needed[n,]$M
+  #           points.needed[n,]$MZ = points.needed[n,]$z/points.needed[n,]$M
+  #         }
+  #         
+  #   #print(points.needed) #checkpoint
+  # 
+  #   # Sum together all values calculated in the above for loops to create a total MX, MY, and MZ value
+  #   MXT = sum(points.needed$MX)
+  #   MYT = sum(points.needed$MY)
+  #   MZT = sum(points.needed$MZ)
+  #   
+  #   spider.muscles[i,]$MXT = MXT #store value in matrix
+  #   spider.muscles[i,]$MYT = MYT #store value in matrix
+  #   spider.muscles[i,]$MZT = MZT #store value in matrix
+  #   
+  #   spider.muscles[i,]$MM = ((MXT^2)+(MYT^2)+(MZT^2))^0.5 ## Magnitude of muscle
+  # 
+  #     spider.muscles[i,]$CW = spider.measurements[specimen,]$Carapace.Width #store carapace width to be used in further calculations 
+  #     
+  #     # Calculate the cross-sectional fiber area
+  #     spider.muscles[i,]$IA = area(w)
+  #     spider.muscles[i,]$N = check.measurements[i,]$Estimated.Fibers
+  #     spider.muscles[i,]$FA = spider.muscles[i,]$IA/spider.muscles[i,]$N
+  #   
+  #     # Correct muscle force values for cross-sectional fiber area
+  #   #Correct values for fiber area
+  #   spider.muscles[i,]$MXT.FA = MXT * spider.muscles[i,]$FA
+  #   spider.muscles[i,]$MYT.FA = MYT * spider.muscles[i,]$FA
+  #   spider.muscles[i,]$MZT.FA = MZT * spider.muscles[i,]$FA
+  #   spider.muscles[i,]$MM.FA = spider.muscles[i,]$MM * spider.muscles[i,]$FA
+  # 
+  #   
+  # ##### CALCULATE VECTOR ANGLE AND MAGNITUDE #####
+  # points.needed$AXY = NA
+  # points.needed$MXY = NA
+  # points.needed$AXZ = NA
+  # points.needed$MXZ = NA
+  # points.needed$AYZ = NA
+  # points.needed$MYZ = NA
+  # 
+  # #Vector in Plane XY (horizontal)
+  #   #Calculate Angle of Mean Vector
+  #   for(n in 1:nrow(points.needed)) { #for each fiber
+  #     #determine angle of each fiber and sum them
+  #     points.needed[n,]$AXY = atan(points.needed[n,]$x/points.needed[n,]$y)
+  #     points.needed[n,]$AXY = rad2deg(points.needed[n,]$AXY)
+  #   }
+  # 
+  #   SumAXY = sum(points.needed$AXY)
+  #   Ave.AXY = (sum(points.needed$AXY)) / nrow(points.needed) #<determine mean fiber angle>
+  #   #print(Ave.AXY)        
+  #   
+  #   spider.muscles[i,]$StDev.AXY = sd(points.needed$AXY)
+  #   spider.muscles[i,]$Min.AXY = min(points.needed$AXY)
+  #   spider.muscles[i,]$Max.AXY = max(points.needed$AXY)
+  #   spider.muscles[i,]$Span.AXY = spider.muscles[i,]$Max.AXY - spider.muscles[i,]$Min.AXY
+  #   spider.muscles[i,]$Ave.AXY = Ave.AXY
+  # 
+  #   #Calculate Magnitude of Mean Vector
+  #   for(n in 1:nrow(points.needed)) { #for each fiber
+  #     #calculate portion of unit fiber force to magnitude of mean vector
+  #     MXY = cos(deg2rad(abs(spider.muscles[i,]$Ave.AXY - points.needed[n,]$AXY)))
+  #     points.needed[n,]$MXY = MXY
+  #   }
+  #    
+  #   spider.muscles[i,]$SumMXY = sum(points.needed$MXY)
+  #   spider.muscles[i,]$SumMXY.FA = spider.muscles[i,]$SumMXY * spider.muscles[i,]$FA
+  #   
+  #   
+  # #Vector in Plane XZ (cross sectional plane)
+  #   #Calculate Angle of Mean Vector
+  #   for(n in 1:nrow(points.needed)) { #for each fiber
+  #     #determine angle of each fiber and sum them
+  #     points.needed[n,]$AXZ = atan(points.needed[n,]$x/points.needed[n,]$z)
+  #     points.needed[n,]$AXZ = rad2deg(points.needed[n,]$AXZ)
+  #   }
+  # 
+  #   SumAXZ = sum(points.needed$AXZ)
+  #   Ave.AXZ = (sum(points.needed$AXZ)) / nrow(points.needed) #<determine mean fiber angle>
+  #   #print(Ave.AXZ)        
+  #   
+  #   spider.muscles[i,]$StDev.AXZ = sd(points.needed$AXZ)
+  #   spider.muscles[i,]$Min.AXZ = min(points.needed$AXZ)
+  #   spider.muscles[i,]$Max.AXZ = max(points.needed$AXZ)
+  #   spider.muscles[i,]$Span.AXZ = spider.muscles[i,]$Max.AXZ - spider.muscles[i,]$Min.AXZ
+  #    spider.muscles[i,]$Ave.AXZ = Ave.AXZ
+  # 
+  #   #Calculate Magnitude of Mean Vector
+  #   for(n in 1:nrow(points.needed)) { #for each fiber
+  #     #calculate portion of unit fiber force to magnitude of mean vector
+  #     MXZ = cos(deg2rad(abs(spider.muscles[i,]$Ave.AXZ - points.needed[n,]$AXZ)))
+  #     points.needed[n,]$MXZ = MXZ
+  # 
+  #         }
+  #    
+  #   spider.muscles[i,]$SumMXZ = sum(points.needed$MXZ)
+  #   spider.muscles[i,]$SumMXZ.FA = spider.muscles[i,]$SumMXZ * spider.muscles[i,]$FA
+  # 
+  #   
+  # #Vector in Plane YZ (Mid-sagittal plane)
+  #   #Calculate Angle of Mean Vector
+  #   for(n in 1:nrow(points.needed)) { #for each fiber
+  #     #determine angle of each fiber and sum them
+  #     points.needed[n,]$AYZ = atan(points.needed[n,]$y/points.needed[n,]$z)
+  #     points.needed[n,]$AYZ = rad2deg(points.needed[n,]$AYZ)
+  #   }
+  # 
+  #   SumAYZ = sum(points.needed$AYZ)
+  #   Ave.AYZ = (sum(points.needed$AYZ)) / nrow(points.needed) #<determine mean fiber angle>
+  #   #print(Ave.AXY)        
+  #   
+  #   spider.muscles[i,]$StDev.AYZ = sd(points.needed$AYZ)
+  #   spider.muscles[i,]$Min.AYZ = min(points.needed$AYZ)
+  #   spider.muscles[i,]$Max.AYZ = max(points.needed$AYZ)
+  #   spider.muscles[i,]$Span.AYZ = spider.muscles[i,]$Max.AYZ - spider.muscles[i,]$Min.AYZ
+  #    spider.muscles[i,]$Ave.AYZ = Ave.AYZ
+  # 
+  #   #Calculate Magnitude of Mean Vector
+  #   for(n in 1:nrow(points.needed)) { #for each fiber
+  #     #calculate portion of unit fiber force to magnitude of mean vector
+  #     MYZ = cos(deg2rad(abs(spider.muscles[i,]$Ave.AYZ - points.needed[n,]$AYZ)))
+  #     points.needed[n,]$MYZ = MYZ
+  #   }
+  #    
+  #   spider.muscles[i,]$SumMYZ = sum(points.needed$MYZ)
+  #   spider.muscles[i,]$SumMYZ.FA = spider.muscles[i,]$SumMYZ * spider.muscles[i,]$FA
+  #   
+  # 
+  #   points_list[[i]] = points.needed
+  #   
+    
+    
+  ##### ADD SPECIMEN DATA TO MATRIX AND PRINT NOTICE OF COMPLETION #####
+    #add species name and phylo placement to column
+    spider.muscles[i,]$Species = spider.measurements[row.names(spider.muscles[i,]),]$Species
+    spider.muscles[i,]$InPhylogeny = spider.measurements[row.names(spider.muscles[i,]),]$InPhylogeny
+    spider.muscles[i,]$ID = spider.measurements[row.names(spider.muscles[i,]),]$ID
+
+
+  print(paste0("Muscle modeling for ", specimen, " has finished")) #checkpoint
+}
+```
+
+```{r Save Muscle Data to Files}
+write.csv(spider.muscles, file = "../2_Output/MuscleModeling.csv")
+names(polygon_list) = gsub("\\_.*","",centroids)
+capture.output(polygon_list, file = "../2_Output/polygons.translated.txt")
+
+names(points_list) = gsub("\\_.*","",centroids)
+
+  for(i in 1:nrow(spider.muscles)) { 
+    write.csv(points_list[[i]], file = paste("../2_Output/Data.For.Each.Point/",rownames(spider.muscles)[i],".csv",sep=""))
+  }
+```
+
+```{r Test if polygons are in correct location}
+### Test for landmark placement of polygons vs centroid
+# !!! the results_list is in (y,x,z) format !!!
+         for(i in 1:nrow(spider.muscles)) {       # for-loop over rows
+           #plot(0, 0, pch=21, bg="pink")#, xlim= c(-6,6), ylim = c(-6,6))
+           #points(polygon_list[[i]][,1], polygon_list[[i]][,3], pch=21, bg="green")
+          
+             png(file=paste("../2_Output/ICSpolygon.Images/",polygons[i],".png",sep=""), width = 500, height = 500)
+             plot(polygon_list[[i]][,2], polygon_list[[i]][,3], pch=21, bg="green", 
+                  xlim = c(max(polygon_list[[i]])*-1,max(polygon_list[[i]])), 
+                  ylim = c(0,max(polygon_list[[i]]))
+                  )
+            points(0, 0, pch=21, bg="pink")
+            
+           title(main = rownames(spider.muscles)[i])
+           addTextLabels(polygon_list[[i]][,2], polygon_list[[i]][,3], row.names(polygon_list[[i]]))
+           
+           dev.off()
+         }
+```
+
+```{r Test if Estimated Values are Accurate}
+check.check = na.omit(check.measurements)
+
+#cor.test(check.check$Total.FibersL, check.check$Estimated.Fibers, method = c("pearson", "kendall", "spearman"))
+
+#cor 0.9935815 (p-value < 2.2e-16)
+
+fiberstest = lm(check.check$Total.FibersL ~ check.check$Estimated.Fibers)
+summary(fiberstest)
+                             # Estimate Std. Error  t value Pr(>|t|) 
+# (Intercept)                   1.74196    0.96892  1.798   0.0784 .
+# check.check$Estimated.Fibers  0.97255    0.01582  61.485   <2e-16 ***
+```
+
+```{r Phylomorphospaces}
+tree<-read.tree("../1_Code/timetree.tre")
+plot(tree)
+
+#Trim Coords to match muscle data
+keep=unique(as.factor(row.names(spider.muscles)))
+coords=two.d.array(GPA$coords)
+rownames(coords)=gsub("\\_.*","",rownames(coords))
+
+#Trim phylogeny
+trimmed.tree=drop.tip(tree,tree$tip.label[-na.omit(match(keep, tree$tip.label))])
+length(trimmed.tree$tip.label) #55 tips
+plot(trimmed.tree)
+
+#Final Trim Coords
+coords=coords[match(trimmed.tree$tip.label, rownames(coords)),]
+coords.3darray=arrayspecs(coords, 257, 3)
+
+#PCA and plot in morphospace
+phyPCA<-gm.prcomp(coords.3darray, phy = trimmed.tree, align.to.phy = F)
+summary.phyPCA <- summary(phyPCA)
+lambda=phyPCA$sdev^2 
+sig_axes = bsDimension(lambda) #2 significant axes
+
+plot(phyPCA, phylo = T, time.plot = F, pch=21, bg="black",cex=1.5, phylo.par = list(tip.labels = F, node.labels = F, anc.states = TRUE, node.bg ="dark grey", node.cex = .75, edge.color = "grey", edge.width = 1.5, tip.txt.cex = 1,node.txt.cex = .75, node.txt.col = "grey", node.txt.adj = c(-0.1, -0.1)))
+addTextLabels(phyPCA$x[,1], phyPCA$x[,2], dimnames(coords.3darray)[[3]], col.label="black")
+```
+
+```{r Warp to geomorph Extremes}
+# spheres3d(PCA$shapes$shapes.comp1$min,radius=.01)
+
+findMeanSpec(GPA$coords) #Trachelas_tranquillus
+
+warpPC1min <- tps3d(Trachelas_tranquillus,homo.surface.only[,,"Trachelas_tranquillus"],PCA$shapes$shapes.comp1$min)
+warpPC1max <- tps3d(Trachelas_tranquillus,homo.surface.only[,,"Trachelas_tranquillus"],PCA$shapes$shapes.comp1$max)
+shade3d(warpPC1min,col="#aadde1")
+shade3d(warpPC1max,col="#e95f4f")
+
+#PC2 extremes (min and max coordinates *1.2)
+warpPC2min <- tps3d(Trachelas_tranquillus,homo.surface.only[,,"Trachelas_tranquillus"],PCA$shapes$shapes.comp2$min)
+warpPC2max <- tps3d(Trachelas_tranquillus,homo.surface.only[,,"Trachelas_tranquillus"],PCA$shapes$shapes.comp2$max)
+shade3d(warpPC2min,col="#aadde1")
+shade3d(warpPC2max,col="#e95f4f")
+```
+
+```{r Extremes Figure}
+mfrow3d(2,2)
+shade3d(warpPC1min,col="#aadde1"); next3d()
+shade3d(warpPC1max,col="#e95f4f"); next3d()
+shade3d(warpPC2min,col="#aadde1"); next3d()
+shade3d(warpPC2max,col="#e95f4f")
+```
+
+```{r PCA for muscle modeling data}
+forces.corrected = read.csv("~/Desktop/Research Projects/SpiderICS_2023/0_Raw Data/Results.ICS_2024.02.25.csv", row.names = 1)
+forces.corrected=forces.corrected[match(trimmed.tree$tip.label, rownames(forces.corrected)),]
+
+NA.forces.corrected = na.omit(forces.corrected)
+
+pca = prcomp(NA.forces.corrected[,10:18], scale. = F)
+summary(pca)
+
+# All variables
+fviz_pca_var(pca,
+              # col.ind = "cos2", # Color by the quality of representation
+              # gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+             
+fviz_pca_biplot(pca,
+                col.var = "black",
+                col.ind = "grey",
+ repel = TRUE)
+
+fviz_pca_biplot(pca,
+                axes = c(3, 4),
+                col.var = "black",
+                col.ind = "grey",
+ repel = TRUE)
+
+```
+
+```{r Evolutionary Rates}
+## Filter measurements file to fit phylo
+include=trimmed.tree$tip.label
+spider.measurements.trimmed=subset(spider.measurements, rownames(spider.measurements) %in% include)
+spider.measurements.trimmed=spider.measurements.trimmed[match(trimmed.tree$tip.label, rownames(spider.measurements.trimmed)),]
+check.trimmed=subset(check.measurements, rownames(check.measurements) %in% include)
+check.trimmed=check.trimmed[match(trimmed.tree$tip.label, rownames(check.trimmed)),]
+spider.muscles.phy= subset(spider.muscles, rownames(spider.muscles) %in% include)
+spider.muscles.phy=spider.muscles.phy[match(trimmed.tree$tip.label, rownames(spider.muscles.phy)),]
+
+forces.corrected=forces.corrected[match(trimmed.tree$tip.label, rownames(forces.corrected)),]
+
+## For missing data
+keep=unique(as.factor(row.names(NA.forces.corrected)))
+NA.trimmed.tree=drop.tip(trimmed.tree,trimmed.tree$tip.label[-na.omit(match(keep, trimmed.tree$tip.label))])
+length(NA.trimmed.tree$tip.label)
+NA.coords=coords[match(NA.trimmed.tree$tip.label, rownames(coords)),]
+NA.coords.3darray=arrayspecs(NA.coords, 257, 3)
+
+#### Evolutionary rates of shape ####
+PCA_sig <- phyPCA$x[trimmed.tree$tip.label, 1:4] #accounts for ~80% of total shape
+fit_1 <- mvBM(trimmed.tree, PCA_sig, model = "BM1", optimization = "subplex", control = list(maxit = 10000)) #BEST FIT 
+fit_2 <- mvOU(trimmed.tree, PCA_sig, model = "OU1")
+fit_3 <- mvEB(trimmed.tree, PCA_sig)
+
+fit_1$AICc; fit_2$AICc; fit_3$AICc ## ICS follows BM model, next best OU; ICS does not seem to evolve towards optimum
+# [1] -286.0555
+# [1] -281.0971
+# [1] -283.7213
+
+summary(fit_1)
+fit_1$sigma  
+
+  # Evolves under Brownian Motion which may suggest why there is no correlation to functional values. There does not seem to be an evolutionary force that is driving ICS to an optimal shape.
+
+#### Evolutionary rates for muscle modeling ####
+  ## Polygon area
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$PArea.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$PArea.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$PArea.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] -460.8859 #BM
+    # [1] -456.0218
+    # [1] -458.6461
+  
+  ## Fiber Number
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$FibNo.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$FibNo.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$FibNo.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] 577.562 #BM
+    # [1] 579.8018
+    # [1] 579.8018
+  
+  ## Fiber area
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$FibArea.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$FibArea.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$FibArea.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] -704.2729
+    # [1] -704.8513
+    # [1] -702.0331 # EB
+
+  ## X axis skewness
+  force.fit.1 <- mvBM(NA.trimmed.tree, (NA.forces.corrected$SKEWX.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(NA.trimmed.tree, (NA.forces.corrected$SKEWX.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(NA.trimmed.tree, (NA.forces.corrected$SKEWX.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] 123.8336
+    # [1] 102.4222 #OU
+    # [1] 126.1001
+  
+  ## Y axis skewness
+  force.fit.1 <- mvBM(NA.trimmed.tree, (NA.forces.corrected$SKEWY.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(NA.trimmed.tree, (NA.forces.corrected$SKEWY.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(NA.trimmed.tree, (NA.forces.corrected$SKEWY.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] 36.30392
+    # [1] 32.29387 #OU
+    # [1] 38.57034
+  
+  ## Angle of total force
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$AMUS.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$AMUS.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$AMUS.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] 492.7156
+    # [1] 490.3173 #OU
+    # [1] 494.9555
+
+  ## Total magnitude
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$FMUS.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$FMUS.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$FMUS.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] -411.8483 #BM
+    # [1] -405.0431
+    # [1] -409.7227
+  
+  ## Anterior-Posterior magnitude (FCPY)
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$FCPY.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$FCPY.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$FCPY.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] -516.5581
+    # [1] -522.3801 #OU
+    # [1] -514.3183
+  
+  ## Dorsal-Ventral magnitude (FCPZ)
+  force.fit.1 <- mvBM(trimmed.tree, (forces.corrected$FCPZ.SzCorr), model = "BM1")
+  force.fit.2 <- mvOU(trimmed.tree, (forces.corrected$FCPZ.SzCorr), model = "OU1")
+  force.fit.3 <- mvEB(trimmed.tree, (forces.corrected$FCPZ.SzCorr))
+  
+  force.fit.1$AICc; force.fit.2$AICc; force.fit.3$AICc
+    # [1] -414.7148 #BM
+    # [1] -407.4861
+    # [1] -412.6489
+
+### The angle of pull evolves toward an optimum suggesting this force is constrained by something, whereas force is not constrained and experiences random walks (i.e. not as important to evolution as angle)
+  
+#### Webs ####
+webs = read.csv("~/Desktop/Research Projects/SpiderICS_2023/0_Raw Data/WebTraits.csv", row.names = 1)
+webs=webs[match(trimmed.tree$tip.label, rownames(webs)),]
+
+  # Web type
+  web.fit.1 <- mvBM(trimmed.tree, as.factor(webs$Web.Code), model = "BM1") # BM best fit model
+  web.fit.2 <- mvOU(trimmed.tree, (webs$Web.Code), model = "OU1")
+  web.fit.3 <- mvEB(trimmed.tree, as.factor(webs$Web.Code))
+  
+  web.fit.1$AICc; web.fit.2$AICc; web.fit.3$AICc
+
+  # presence of foraging web
+  web.fit.1 <- mvBM(trimmed.tree, (webs$Foraging.web), model = "BM1") # BM best fit model
+  web.fit.2 <- mvOU(trimmed.tree, (webs$Foraging.web), model = "OU1")
+  web.fit.3 <- mvEB(trimmed.tree, (webs$Foraging.web))
+  
+  web.fit.1$AICc; web.fit.2$AICc; web.fit.3$AICc
+```
+
+```{r PhySignal}
+## For shape
+PS.shape = physignal(coords.3darray, trimmed.tree) #K = 0.8435 (p=0.001) meaning a good amount of shape is explained by phylogenetic relationships; Strong phylogenetic signal for PC1 and PC2 = PC1 = 1.0139833 ;  PC2 = 0.9305321
+plot(PS.shape)
+PS.shape$K.by.p #PS for each PC
+
+#For muscle
+
+PS.Polygon = phylosig(trimmed.tree, forces.corrected$PArea.SzCorr, test = T)
+PS.Polygon #K : 0.977485 p=0.001
+
+PS.FibNo = phylosig(trimmed.tree, forces.corrected$FibNo.SzCorr, test = T)
+PS.FibNo #K : 1.84698 p=0.002
+
+PS.FibArea = phylosig(trimmed.tree, forces.corrected$FibArea.SzCorr, test = T)
+PS.FibArea #K : 0.748971 p=0.129
+
+PS.SkewX = phylosig(trimmed.tree, forces.corrected$SKEWX.SzCorr, test = T)
+PS.SkewX #K : 0.446483 p=0.868
+
+PS.SkewY = phylosig(trimmed.tree, forces.corrected$SKEWY.SzCorr, test = T)
+PS.SkewY #K : 0.653819 p=0.162
+
+PS.AMUS = phylosig(trimmed.tree, forces.corrected$AMUS.SzCorr, test = T)
+PS.AMUS #K : 0.840056 p=0.017
+
+PS.FMUS = phylosig(trimmed.tree, forces.corrected$FMUS.SzCorr, test = T)
+PS.FMUS #K : 1.02873 p=0.004
+
+PS.FCPY = phylosig(trimmed.tree, forces.corrected$FCPY.SzCorr, test = T)
+PS.FCPY #K : 0.613205 p=0.255
+
+PS.FCPZ = phylosig(trimmed.tree, forces.corrected$FCPZ.SzCorr, test = T)
+PS.FCPZ #K : 1.05479 p=0.004
+```
+
+```{r PGLS - Shape of ICS}
+webs = read.csv("~/Desktop/Research Projects/SpiderICS_2023/0_Raw Data/WebTraits.csv", row.names = 1)
+webs=webs[match(trimmed.tree$tip.label, rownames(webs)),]
+
+## Webs and ICS shape - no correlation
+pgls.webs = procD.pgls(coords.3darray ~ as.character(webs$Web.Code), SS.type = "III", trimmed.tree)
+summary(pgls.webs) #no significant difference of ICS shape in regard to web presence or type
+
+pgls.foraging = procD.pgls(coords.3darray ~ as.character(webs$Foraging.web), SS.type = "III", trimmed.tree)
+summary(pgls.foraging) #no significant difference of ICS shape in regard to web presence or type
+
+## ICS and Muscle values
+pgls.PArea = procD.pgls(coords.3darray ~ forces.corrected$PArea.SzCorr, SS.type = "III", trimmed.tree)
+pgls.FibNo = procD.pgls(coords.3darray ~ forces.corrected$FibNo.SzCorr, SS.type = "III", trimmed.tree)
+pgls.FibArea = procD.pgls(coords.3darray ~ forces.corrected$FibArea.SzCorr, SS.type = "III", trimmed.tree)
+pgls.skewX = procD.pgls(NA.coords.3darray ~ NA.forces.corrected$SKEWX.SzCorr, SS.type = "III", NA.trimmed.tree)
+pgls.skewY = procD.pgls(NA.coords.3darray ~ NA.forces.corrected$SKEWY.SzCorr, SS.type = "III", NA.trimmed.tree)
+pgls.AMUS = procD.pgls(coords.3darray ~ forces.corrected$AMUS.SzCorr, SS.type = "III", trimmed.tree)
+pgls.FMUS = procD.pgls(coords.3darray ~ forces.corrected$FMUS.SzCorr, SS.type = "III", trimmed.tree)
+pgls.FCPY = procD.pgls(coords.3darray ~ forces.corrected$FCPY.SzCorr, SS.type = "III", trimmed.tree)
+pgls.FCPZ = procD.pgls(coords.3darray ~ forces.corrected$FCPZ.SzCorr, SS.type = "III", trimmed.tree)
+
+summary(pgls.PArea)
+summary(pgls.FibNo) #hit
+summary(pgls.FibArea)
+summary(pgls.skewX)
+summary(pgls.skewY)
+summary(pgls.AMUS)
+summary(pgls.FMUS)
+summary(pgls.FCPY)
+summary(pgls.FCPZ)
+
+
+#### Significant findings ####
+summary(pgls.FibNo) #Significant for Fiber number
+# 	Df	SS	MS	Rsq	F	Z	Pr(>F)	
+# forces.corrected$FibNo.SzCorr	1	0.0013869	0.00138685	0.0442	2.4507	1.7749	0.043	*
+# Residuals	53	0.0299922	0.00056589	0.9558				
+# Total	54	0.0313791						
+
+#Create color palette to plot relative muscle force onto PCA
+basecol=met.brewer("Hiroshige", 85, type = "continuous", direction = -1)
+con.colors=colorRampPalette(basecol)
+phy.muscle.col <- con.colors(15)[as.numeric(cut(forces.corrected$FibNo.SzCorr,breaks = 15))]
+names(phy.muscle.col)=rownames(forces.corrected)
+
+#Plot phylomorphospace with colors are relative muscle force and size of data point as carapace width
+pdf(file = "../2_Output/PhyPCAonetwo.FiberCount.pdf", width=10, height=8)
+plot(phyPCA, phylo = T, time.plot = F, pch=21, bg=phy.muscle.col, cex = 1.5,phylo.par = list(tip.labels = F, node.labels = F, anc.states = TRUE, node.bg ="dark grey", node.cex = .75, edge.color = "grey", edge.width = 1.5, tip.txt.cex = 1,node.txt.cex = .75, node.txt.col = "grey", node.txt.adj = c(-0.1, -0.1)))
+addTextLabels(phyPCA$x[,1], phyPCA$x[,2], spider.measurements.trimmed$Figure)
+dev.off()
+```
+
+```{r PGLS - Forces and Webs}
+### Compare force values to web presence
+spiderData = forces.corrected
+spiderData$web = webs$Web.Code
+spiderData$foraging = webs$Foraging.web
+identical(rownames(spiderData), trimmed.tree$tip.label)
+
+pgls.foraging.PArea = gls(PArea.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+pgls.foraging.FibNo = gls(FibNo.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+pgls.foraging.FibArea = gls(FibArea.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+pgls.foraging.AMUS = gls(AMUS.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+pgls.foraging.FCPY = gls(FCPY.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+pgls.foraging.FCPZ = gls(FCPZ.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+pgls.foraging.FMUS = gls(FMUS.SzCorr ~ as.character(foraging) , correlation = corBrownian(phy = trimmed.tree), data = spiderData, method = "ML")
+
+summary(pgls.foraging.PArea)
+summary(pgls.foraging.FibNo)
+summary(pgls.foraging.FibArea)
+summary(pgls.foraging.AMUS)
+summary(pgls.foraging.FCPY)
+summary(pgls.foraging.FCPZ)
+summary(pgls.foraging.FMUS)
+
+
+# With missing data
+NA.webs=webs[match(NA.trimmed.tree$tip.label, rownames(webs)),]
+spiderData.NA = NA.forces.corrected
+spiderData.NA$web = NA.webs$Web.Code
+spiderData.NA$foraging = NA.webs$Foraging.web
+identical(rownames(spiderData.NA), NA.trimmed.tree$tip.label)
+
+is.na(spiderData$SKEWX.SzCorr)
+pgls.SKEWX <- gls(SKEWX.SzCorr ~ as.character(foraging), correlation = corBrownian(phy = NA.trimmed.tree), data = spiderData.NA, method = "ML")
+
+is.na(spiderData$SKEWY.SzCorr)
+pgls.SKEWY <- gls(SKEWY.SzCorr ~ as.character(foraging), correlation = corBrownian(phy = NA.trimmed.tree), data = spiderData.NA, method = "ML")
+
+summary(pgls.SKEWX)
+summary(pgls.SKEWY)
+```
+
+```{r Ancestral State Reconstruction}
+# Foraging Webs
+Foraging.Type <- setNames(as.character(spiderData$foraging),rownames(spiderData))
+
+pal.for <- c("#920000","#E1F0FF")
+names(pal.for)=unique(spiderData$foraging)
+name.cols.for=pal.for[match(spiderData$foraging, names(pal.for))]
+
+fitER.for<-ace(Foraging.Type,trimmed.tree,model="ER",type="discrete")
+fitER.for
+
+
+# Pull the node numbers and tip names which are probably venomous
+web_nodes <- names(which(fitER.for$lik.anc[,"1"] > 0.50))
+# Tip names are given in the summary, and we need tip numbers
+web_tipnums <- which(spiderData$foraging %in% "1")
+# Then we can exclude those tip names from the venomous nodes also
+web_ancnodes <- as.integer(web_nodes[ ! web_nodes %in% trimmed.tree$tip.label ])
+# Combine
+web_nodenums <- c(web_tipnums, web_ancnodes)
+
+# Paint tree
+painted.tree <- paintBranches(trimmed.tree, edge = web_tipnums, state = "1", anc.state = "0")
+
+plot(painted.tree) #confirm plotting worked
+
+plotTree(trimmed.tree, fsize=0.8, ftype="i", node.numbers=T, tip.numbers = T)
+
+pal.tree <- c("#570000","#9099A3")
+names(pal.tree)=unique(spiderData$foraging)
+name.cols.tree=pal.tree[match(spiderData$foraging, names(pal.tree))]
+
+# plot(painted.tree, col = name.cols.tree)
+# nodelabels(node=1:trimmed.tree$Nnode+Ntip(trimmed.tree),
+#     pie=fitER.for$lik.anc,piecol=name.cols.for,cex=0.5)
+# tiplabels(pie=to.matrix(Foraging.Type,sort(unique(Foraging.Type))),piecol=name.cols.for,cex=0.3)
+
+# Significant Results
+# Polygon Area
+force.PArea.SzCorr = spiderData$PArea.SzCorr
+force.PArea.SzCorr<-setNames(force.PArea.SzCorr,rownames(spiderData))
+fit<-fastAnc(trimmed.tree,force.PArea.SzCorr,vars=TRUE,CI=TRUE)
+print(fit,printlen=10)
+obj<-contMap(trimmed.tree,force.PArea.SzCorr,plot=FALSE)
+obj
+basecol=met.brewer("OKeeffe1", 85, type = "continuous", direction = -1)
+con.colors=colorRampPalette(basecol)
+
+n_cols <- n_distinct(force.PArea.SzCorr)
+obj_color.force.PArea.SzCorr <- setMap(obj, con.colors(n_cols))
+plot(obj_color.force.PArea.SzCorr)
+
+#Fiber Numbers
+force.FibNo.SzCorr = spiderData$FibNo.SzCorr
+force.FibNo.SzCorr<-setNames(force.FibNo.SzCorr,rownames(spiderData))
+fit<-fastAnc(trimmed.tree,force.FibNo.SzCorr,vars=TRUE,CI=TRUE)
+print(fit,printlen=10)
+obj<-contMap(trimmed.tree,force.FibNo.SzCorr,plot=FALSE)
+obj
+basecol=met.brewer("OKeeffe1", 85, type = "continuous", direction = -1)
+con.colors=colorRampPalette(basecol)
+
+n_cols <- n_distinct(force.FibNo.SzCorr)
+obj_color.force.FibNo.SzCorr <- setMap(obj, con.colors(n_cols))
+plot(obj_color.force.FibNo.SzCorr)
+
+# Total Magnitude (FMUS)
+force.FMUS.SzCorr = spiderData$FMUS.SzCorr
+force.FMUS.SzCorr<-setNames(force.FMUS.SzCorr,rownames(spiderData))
+fit<-fastAnc(trimmed.tree,force.FMUS.SzCorr,vars=TRUE,CI=TRUE)
+print(fit,printlen=10)
+obj<-contMap(trimmed.tree,force.FMUS.SzCorr,plot=FALSE)
+obj
+basecol=met.brewer("OKeeffe1", 85, type = "continuous", direction = -1)
+con.colors=colorRampPalette(basecol)
+
+n_cols <- n_distinct(force.FMUS.SzCorr)
+obj_color.force.FMUS.SzCorr <- setMap(obj, con.colors(n_cols))
+plot(obj_color.force.FMUS.SzCorr)
+
+# Dorsal-Ventral Magnitude (FCPZ)
+force.FCPZ.SzCorr = spiderData$FCPZ.SzCorr
+force.FCPZ.SzCorr<-setNames(force.FCPZ.SzCorr,rownames(spiderData))
+fit<-fastAnc(trimmed.tree,force.FCPZ.SzCorr,vars=TRUE,CI=TRUE)
+print(fit,printlen=10)
+obj<-contMap(trimmed.tree,force.FCPZ.SzCorr,plot=FALSE)
+obj
+basecol=met.brewer("OKeeffe1", 85, type = "continuous", direction = -1)
+con.colors=colorRampPalette(basecol)
+
+n_cols <- n_distinct(force.FCPZ.SzCorr)
+obj_color.force.FCPZ.SzCorr <- setMap(obj, con.colors(n_cols))
+plot(obj_color.force.FCPZ.SzCorr)
+
+pdf(file = "../2_Output/AncestralStates.all.nolegend.pdf", width=6, height=5)
+layout(matrix(1:6,1,6),widths=c(0.2,0.2,0.2,0.2,0.1,0.2))
+plot(obj_color.force.PArea.SzCorr, fsize=0.6, digit=1, ftype="off", outline=T, legend = F)
+plot(obj_color.force.FibNo.SzCorr, fsize=0.6, digit=1, ftype="off", outline=T, legend = F)
+plot(obj_color.force.FMUS.SzCorr, fsize=0.6, digit=1, ftype="off", outline=T, legend = F)
+plot(obj_color.force.FCPZ.SzCorr, fsize=0.6, digit=1, ftype="off", outline=T, legend = F)
+plot.new()
+plot.window(xlim=c(-0.09,0.1),
+    ylim=get("last_plot.phylo",envir=.PlotPhyloEnv)$y.lim)
+par(cex=0.6)
+text(rep(0,length(trimmed.tree$tip.label)),1:length(trimmed.tree$tip.label),
+    gsub("_"," ",trimmed.tree$tip.label),font=3, cex=.9)
+plot(painted.tree, col = name.cols.tree, fsize=0.6, ftype="off", direction="leftwards", lwd = 4, outline = F)
+nodelabels(node=1:trimmed.tree$Nnode+Ntip(trimmed.tree), pie=fitER.for$lik.anc,piecol=name.cols.for,cex=2)
+tiplabels(pie=to.matrix(Foraging.Type,sort(unique(Foraging.Type))),piecol=name.cols.for,cex=2)
+dev.off()
+```
+
+```{r Disparity Between Groups}
+morphol.disparity(pgls.foraging, groups = webs$Web.Code)
+morphol.disparity(pgls.foraging, groups = webs$Foraging.web)
+
+pgls.subfams = procD.pgls(coords.3darray ~ spider.measurements.trimmed$Superfamily, SS.type = "III", trimmed.tree)
+summary(pgls.subfams) 
+
+data = morphol.disparity(pgls.subfams, groups = spider.measurements.trimmed$Superfamily)
+
+data$PV.dist
+data$PV.dist.Pval
+data$Procrustes.var
+```
+
+```{r Final Figures}
+basecol=met.brewer("Hiroshige", 85, type = "continuous", direction = -1)
+con.colors=colorRampPalette(basecol)
+
+########################### PCAs ###########################
+#Trim measurements file to include all data points in PCA
+include=gsub("\\_.*","",row.names(PCA$x))
+spider.measurements.fig=spider.measurements[match(include, rownames(spider.measurements)),]
+
+#Create a color palette for PCA of all specimens to denote superfamily level
+numberneeded = nrow(as.matrix(unique(spider.measurements.fig$Superfamily)))
+basecol=viridis_pal(alpha = 1, begin = 0, end = 1)(numberneeded)
+pcacol=as.character(basecol)
+names(pcacol)=unique(spider.measurements.fig$Superfamily)
+pcacol.all=pcacol[match(spider.measurements.fig$Superfamily,names(pcacol))]
+
+#Generate PCA for all shape
+pdf(file = "../2_Output/PCAonetwo.pdf", width=10, height=8)
+plot((PCA$x[,1]), (PCA$x[,2]), pch=21, bg=pcacol.all, cex=1.5)
+addTextLabels((PCA$x[,1]), (PCA$x[,2]), gsub("\\_.*","",row.names(PCA$x)), col.label=pcacol.all)
+dev.off()
+
+#Trim measurements file to match muscle data
+include=row.names(spider.muscles)
+spider.measurements.muscle=spider.measurements[match(include, rownames(spider.measurements)),]
+
+#Trim PCA to match muscle data
+PCA.trimmed = PCA$x
+row.names(PCA.trimmed) = gsub("\\_.*","",row.names(PCA$x))
+PCA.trimmed=PCA.trimmed[match(include, rownames(PCA.trimmed)),]
+
+# #Create color palette to plot relative muscle force onto PCA 
+# muscle.col <- con.colors(15)[as.numeric(cut(spider.muscles$MST.FA.sizecorr.cube,breaks = 15))]
+# names(muscle.col)=rownames(spider.muscles)
+# 
+# #Plot and save PCA so data points are colored to relative muscle force and size of point is indicative of size
+# pdf(file = "../2_Output/PCAonetwo.forces.size.pdf", width=10, height=8)
+# plot((PCA.trimmed[,1]), (PCA.trimmed[,2]), pch=21, bg=muscle.col, cex=(spider.measurements.muscle$Carapace.Width*.001))
+# addTextLabels((PCA.trimmed[,1]), (PCA.trimmed[,2]), row.names(PCA.trimmed), col.label=muscle.col)
+# dev.off()
+
+
+########################### Phylogenetic PCA ###########################
+#Set color palette for phylomorphospace by superfamily
+numberneeded = length(unique(spider.measurements.trimmed$Superfamily))
+phybasecol=viridis_pal(alpha = 1, begin = 0, end = 1)(numberneeded)
+pcacol=as.character(phybasecol)
+names(pcacol)=unique(spider.measurements.trimmed$Superfamily)
+pcacol.all=pcacol[match(spider.measurements.trimmed$Superfamily,names(pcacol))]
+
+#Plot phylomorphospace with colors as superfamily level
+pdf(file = "../2_Output/PhyPCAonetwo.pdf", width=10, height=8)
+plot(phyPCA, phylo = T, time.plot = F, pch=21, bg=pcacol.all, cex=2.5, phylo.par = list(tip.labels = F, node.labels = F, anc.states = TRUE, node.bg ="dark grey", node.cex = .75, edge.color = "grey", edge.width = 1.5, tip.txt.cex = 1,node.txt.cex = .75, node.txt.col = "grey", node.txt.adj = c(-0.1, -0.1)))
+legend("topleft", col=pcacol, pch=19,
+   legend=names(pcacol))
+addTextLabels(phyPCA$x[,1], phyPCA$x[,2], spider.measurements.trimmed$Figure, col.label=pcacol.all)
+dev.off()
+
+# #Create color palette to plot relative muscle force onto PCA 
+# phy.muscle.col <- con.colors(15)[as.numeric(cut(spider.muscles.phy$MST.FA.sizecorr.cube,breaks = 15))]
+# names(muscle.col)=rownames(spider.muscles.phy)
+# 
+# #Plot phylomorphospace with colors are relative muscle force and size of data point as carapace width
+# pdf(file = "../2_Output/PhyPCAonetwo.Forces.Size.corrected.pdf", width=10, height=8)
+# plot(phyPCA, phylo = T, time.plot = F, pch=21, bg=phy.muscle.col, cex= (spider.measurements.trimmed$Carapace.Width*.001), phylo.par = list(tip.labels = F, node.labels = F, anc.states = TRUE, node.bg ="dark grey", node.cex = .75, edge.color = "grey", edge.width = 1.5, tip.txt.cex = 1,node.txt.cex = .75, node.txt.col = "grey", node.txt.adj = c(-0.1, -0.1)))
+# addTextLabels(phyPCA$x[,1], phyPCA$x[,2], dimnames(coords.3darray)[[3]], col.label=phy.muscle.col)
+# dev.off()
+
+# #Create color palette to plot relative muscle force onto PCA 
+# phy.muscle.col <- con.colors(15)[as.numeric(cut(log(spider.muscles.trimmed$MST.FA),breaks = 15))]
+# names(muscle.col)=rownames(spider.muscles.trimmed)
+# 
+# #Plot phylomorphospace with colors are relative muscle force and size of data point as carapace width
+# pdf(file = "../2_Output/PhyPCAonetwo.Forces.Size.pdf", width=10, height=8)
+# plot(phyPCA, phylo = T, time.plot = F, pch=21, bg=phy.muscle.col, cex= (spider.measurements.trimmed$Carapace.Width*.001), phylo.par = list(tip.labels = F, node.labels = F, anc.states = TRUE, node.bg ="dark grey", node.cex = .75, edge.color = "grey", edge.width = 1.5, tip.txt.cex = 1,node.txt.cex = .75, node.txt.col = "grey", node.txt.adj = c(-0.1, -0.1)))
+# addTextLabels(phyPCA$x[,1], phyPCA$x[,2], dimnames(coords.3darray)[[3]], col.label=phy.muscle.col)
+# dev.off()
+
+########################### Ancestral States ###########################
+ pdf(file = "../2_Output/AncestralStates.all.woutlegend.pdf", width=6, height=5)
+layout(matrix(1:5,1,5),widths=c(0.2,0.2,0.2,0.1,0.3))
+
+plot(obj_color.force.MXY, fsize=0.6, digit=1, ftype="off", outline=T, legend=F)
+plot(obj_color.force.MXZ, fsize=0.6, digit=1, ftype="off", outline=T, legend=F)
+plot(obj_color.force.MYZ, fsize=0.6, digit=1, ftype="off", outline=T, legend=F)
+
+plot.new()
+plot.window(xlim=c(-0.09,0.1),
+    ylim=get("last_plot.phylo",envir=.PlotPhyloEnv)$y.lim)
+par(cex=0.6)
+text(rep(0,length(trimmed.tree$tip.label)),1:length(trimmed.tree$tip.label),
+    gsub("_"," ",trimmed.tree$tip.label),font=3, cex=.9)
+
+plot(painted.tree, col = name.cols.tree, fsize=0.6, ftype="off", direction="leftwards", lwd = 3, outline = F)
+nodelabels(node=1:trimmed.tree$Nnode+Ntip(trimmed.tree),
+    pie=fitER.for$lik.anc,piecol=name.cols.for,cex=1.5)
+tiplabels(pie=to.matrix(Foraging.Type,sort(unique(Foraging.Type))),piecol=name.cols.for,cex=1)
+
+ dev.off()
+```
+
+```{r Figure for Talks}
+tip.groups = read.csv("Tree.Tips.All_Superfamilies.csv", header = T, row.names = 1)
+
+keep = row.names(coords)
+
+### Need to color clades and match colors to PCAs
+pdf(file = "../2_Output/TreeArrows.pdf", width=10, height=8)
+plotTree(tree, type="fan", lwd=1, ftype="off", part=0.5)
+for(i in 1:length(keep)){
+  #print(i)
+  xy<-add.arrow(tree, keep[i], col=pcacol.all[i], arrl=15, lwd=3, hedl=4)
+}
+dev.off()
+
+
+pdf(file = "../2_Output/TreeSuperfam.pdf", width=3, height=8)
+plotTree(trimmed.tree, fsize=0.6, lwd = 3, outline = T)
+tiplabels(col="black", bg=pcacol.all,cex=1.5, pch = 21)
+dev.off()
+
+```
+
